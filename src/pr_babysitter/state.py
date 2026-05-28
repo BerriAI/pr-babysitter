@@ -106,6 +106,13 @@ class Subsystem:
     # `reply` and `resolve`) can't double-post. Cleared on commit change.
     # Persisted.
     bugbot_fp_handled_thread_ids: List[str] = field(default_factory=list)
+    # CICD only. Commit sha for which the cicd agent confirmed every failing
+    # job's root cause was an unfixable infra error (AWS unauthorized-IAM-
+    # action — see CICD_PROMPT + _on_cicd_done). When set, `_process_cicd`
+    # short-circuits to DONE without re-evaluating the GitHub verdict, so we
+    # don't respawn the agent every confirmation window to re-confirm the
+    # same unfixable thing. Cleared on commit change (reset()). Persisted.
+    cicd_ignored_commit: Optional[str] = None
 
     def reset(self) -> None:
         self.state = SubState.UNKNOWN
@@ -124,6 +131,7 @@ class Subsystem:
         self.cicd_consecutive_failure_ticks = 0
         self.bugbot_run_posted_commit = None
         self.bugbot_fp_handled_thread_ids = []
+        self.cicd_ignored_commit = None
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +149,7 @@ class Subsystem:
             "cicd_consecutive_failure_ticks": self.cicd_consecutive_failure_ticks,
             "bugbot_run_posted_commit": self.bugbot_run_posted_commit,
             "bugbot_fp_handled_thread_ids": list(self.bugbot_fp_handled_thread_ids),
+            "cicd_ignored_commit": self.cicd_ignored_commit,
         }
 
     @classmethod
@@ -167,6 +176,7 @@ class Subsystem:
             cicd_consecutive_failure_ticks=int(d.get("cicd_consecutive_failure_ticks") or 0),
             bugbot_run_posted_commit=d.get("bugbot_run_posted_commit"),
             bugbot_fp_handled_thread_ids=[str(x) for x in fp_ids],
+            cicd_ignored_commit=d.get("cicd_ignored_commit"),
         )
 
 

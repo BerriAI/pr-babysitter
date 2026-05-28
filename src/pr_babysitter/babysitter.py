@@ -177,10 +177,11 @@ IMPORTANT: this PR's base branch is `{base_branch}` (per the PR's GitHub metadat
 
 - If it failed for a legit reason: before writing a fresh fix, consider whether the failure was already fixed by someone else on the base branch and this PR is simply out of date. Do `git fetch origin {base_branch}`, then scan commits on `origin/{base_branch}` that landed after this branch diverged. If you can point to a specific commit on the base branch that plausibly addresses this exact failing test/path/symbol, fix the PR by merging `origin/{base_branch}` in and pushing. If you can't tie the failure to a base-branch commit, write a direct fix on the branch as usual. Do NOT merge the base branch speculatively - the goal is "is this PR stale?", not "keep this PR in sync with the base."
 - If it failed because of flakiness, surgically re-run only the flaky tests. Do NOT "fix" a flaky test by adding a skip/xfail marker, by deleting the test, or by loosening its assertions until it passes — those are not fixes, they are concealment. Instead, address the root cause head-on: identify the actual race / shared-state leak / time-or-order dependency / network-dependence and fix that. The ONLY acceptable cases for skipping or deleting are when the test exercises behavior that genuinely no longer exists, or when the root cause is provably outside this repo's control (e.g. a third-party service that is intermittently down) AND fixing it is infeasible from inside this PR — and even then, explain that reasoning in the commit message rather than silently muting the test.
+- If every remaining CI/CD failure's root cause is the AWS sentence `Your account is not authorized to perform this action. Please create a support case (https://console.aws.amazon.com/support/home) with details about your use case and we will get back to you.` (or a near-identical AWS unauthorized-IAM-action error), the failures are not fixable from inside this PR — the account literally lacks IAM permission and a re-run will fail the same way. Respond with `{{"error": false, "ignore": true, "reason": "aws auth denied: <briefly name the failing jobs/tests>"}}` instead of re-running or attempting a fix. This parks cicd at DONE for this commit so we don't keep spawning you. Only pick `ignore: true` if you have *actually read the failing job logs* and confirmed every still-failing job dies on this exact AWS error — if even one failing job has a different root cause, fix or re-run that one as usual and do NOT use `ignore: true`.
 
 IMPORTANT: as soon as you have either pushed a fix OR issued the surgical re-run API call, emit the envelope below and stop. Do NOT wait for the re-run to complete or the new CI/CD status to settle — the babysitter re-evaluates CI/CD on its own schedule and will spawn you again if the failure persists. Long blocking waits inside the session (e.g. `sleep` + polling CircleCI) risk the backend killing the session before you get a chance to emit the envelope.
 
-Respond with `{{"error": false}}` if and only if either you fixed the CI/CD problems, or they were flaky and you re-ran only the flaky tests. Respond with `{{"error": true, "reason": "..."}}` if and only if the CI/CD failure could not be fixed (e.g. OpenAI billing out of money). Respond with `{{"error": true, "reason": "interrupted: <what got done, what's missing>"}}` if your investigation was killed mid-task (backend retries exhausted, internal service error before you could read the failing logs) — do NOT issue a speculative re-run or guess at a fix just to emit a clean envelope.
+Respond with `{{"error": false, "ignore": true, "reason": "..."}}` only in the AWS-auth-denied case described above. Respond with `{{"error": false}}` if and only if either you fixed the CI/CD problems, or they were flaky and you re-ran only the flaky tests. Respond with `{{"error": true, "reason": "..."}}` if and only if the CI/CD failure could not be fixed (e.g. OpenAI billing out of money). Respond with `{{"error": true, "reason": "interrupted: <what got done, what's missing>"}}` if your investigation was killed mid-task (backend retries exhausted, internal service error before you could read the failing logs) — do NOT issue a speculative re-run or guess at a fix just to emit a clean envelope, and do NOT pick `ignore: true` just to escape an investigation you didn't complete.
 """
 
 
@@ -1046,6 +1047,17 @@ class PRBabysitter:
         sha = self.pr.last_commit_sha
         if not sha:
             return
+        # If a prior agent verified this SHA's failures are not actionable
+        # (e.g. AWS unauthorized-IAM-action — see CICD_PROMPT + _on_cicd_done),
+        # park at DONE without re-evaluating. The underlying CircleCI verdict
+        # is still `failure` and will stay that way until HEAD moves, so
+        # without this short-circuit we'd just respawn the agent every
+        # CICD_FAILURE_TICKS_BEFORE_RESPAWN window to re-confirm the same
+        # unfixable thing.
+        if sub.cicd_ignored_commit and sub.cicd_ignored_commit == sha:
+            if sub.state != SubState.DONE:
+                sub.state = SubState.DONE
+            return
         prev_state = sub.state.value
         verdict = await self._compute_cicd_verdict(sha)
         if verdict == "success":
@@ -1258,6 +1270,17 @@ class PRBabysitter:
             sub.state = SubState.ERROR
             sub.error_reason = envelope.get("reason", "unrecoverable cicd failure")
             sub.detail = sub.error_reason
+        elif envelope.get("ignore") is True:
+            # Agent verified every remaining failure is the AWS unauthorized-IAM
+            # error (see CICD_PROMPT) — not fixable from inside the PR. Park at
+            # DONE for this SHA and remember the SHA so `_process_cicd` short-
+            # circuits subsequent ticks instead of seeing the still-red verdict
+            # and respawning. Cleared when HEAD moves (Subsystem.reset()).
+            sub.cicd_ignored_commit = self.pr.last_commit_sha
+            sub.state = SubState.DONE
+            sub.detail = envelope.get("reason") or "cicd failure not actionable; ignoring"
+            sub.error_reason = None
+            sub.cicd_consecutive_failure_ticks = 0
         else:
             sub.state = SubState.UNKNOWN
             sub.detail = "claude reran/fixed cicd; re-evaluating"
