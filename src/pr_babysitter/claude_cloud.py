@@ -19,7 +19,7 @@ ANTHROPIC_API = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 
-# Model used by the babysitter agent. Managed Agents resolves "claude-opus-4-7"
+# Model used by the babysitter agent. Managed Agents resolves "claude-opus-4-8"
 # to the standard (non-1M-context) variant by default, which matches the prior
 # Claude Cloud contract. The Managed Agents POST /v1/agents schema (see
 # https://platform.claude.com/docs/en/managed-agents/agent-setup) only accepts
@@ -28,7 +28,7 @@ MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 # any of them returns 400 "Extra inputs are not permitted". The only model-side
 # knob is `speed: "fast"` (fast mode), which is the opposite of what we want.
 # So we just pass the model name and let Anthropic pick the default behavior.
-AGENT_MODEL = "claude-opus-4-7"
+AGENT_MODEL = "claude-opus-4-8"
 
 # Where the PR's repository is cloned inside the session container. The system
 # prompt references this path so the user-message prompts don't have to.
