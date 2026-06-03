@@ -446,6 +446,7 @@ class MainScreen(Screen):
             claude=app.claude,
             poll_interval=app.config.poll_interval_seconds,
             on_change=lambda: self.call_from_thread_safe(self._refresh_row, pr.key),
+            on_merged=lambda: self.call_from_thread_safe(self._on_pr_merged, pr.key),
         )
         self._babysitters[pr.key] = bs
         table = self.query_one("#pr-table", DataTable)
@@ -457,6 +458,14 @@ class MainScreen(Screen):
         )
         bs.start()
         self._persist_state()
+
+    def _on_pr_merged(self, key: str) -> None:
+        """Auto-remove a PR the babysitter reported merged. Notifies so a row
+        vanishing on its own is explained rather than surprising."""
+        if key not in self._babysitters:
+            return
+        self.notify(f"{key} merged — removed from babysit list.", timeout=4)
+        self._remove_pr(key)
 
     def _remove_pr(self, key: str) -> None:
         bs = self._babysitters.pop(key, None)

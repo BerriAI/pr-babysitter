@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from .claude_cloud import ClaudeCloudClient, SessionSpawnQuotaError, extract_envelope
+from .claude_cloud import ClaudeCloudClient, TransientSpawnError, extract_envelope
 from .config import CONFIG_DIR, _write_text_secure
 from .github_api import Comment, GitHubClient
 from .state import (
@@ -177,10 +177,11 @@ IMPORTANT: this PR's base branch is `{base_branch}` (per the PR's GitHub metadat
 
 - If it failed for a legit reason: before writing a fresh fix, consider whether the failure was already fixed by someone else on the base branch and this PR is simply out of date. Do `git fetch origin {base_branch}`, then scan commits on `origin/{base_branch}` that landed after this branch diverged. If you can point to a specific commit on the base branch that plausibly addresses this exact failing test/path/symbol, fix the PR by merging `origin/{base_branch}` in and pushing. If you can't tie the failure to a base-branch commit, write a direct fix on the branch as usual. Do NOT merge the base branch speculatively - the goal is "is this PR stale?", not "keep this PR in sync with the base."
 - If it failed because of flakiness, surgically re-run only the flaky tests. Do NOT "fix" a flaky test by adding a skip/xfail marker, by deleting the test, or by loosening its assertions until it passes — those are not fixes, they are concealment. Instead, address the root cause head-on: identify the actual race / shared-state leak / time-or-order dependency / network-dependence and fix that. The ONLY acceptable cases for skipping or deleting are when the test exercises behavior that genuinely no longer exists, or when the root cause is provably outside this repo's control (e.g. a third-party service that is intermittently down) AND fixing it is infeasible from inside this PR — and even then, explain that reasoning in the commit message rather than silently muting the test.
+- If every remaining CI/CD failure's root cause is the AWS sentence `Your account is not authorized to perform this action. Please create a support case (https://console.aws.amazon.com/support/home) with details about your use case and we will get back to you.` (or a near-identical AWS unauthorized-IAM-action error), the failures are not fixable from inside this PR — the account literally lacks IAM permission and a re-run will fail the same way. Respond with `{{"error": false, "ignore": true, "reason": "aws auth denied: <briefly name the failing jobs/tests>"}}` instead of re-running or attempting a fix. This parks cicd at DONE for this commit so we don't keep spawning you. Only pick `ignore: true` if you have *actually read the failing job logs* and confirmed every still-failing job dies on this exact AWS error — if even one failing job has a different root cause, fix or re-run that one as usual and do NOT use `ignore: true`.
 
 IMPORTANT: as soon as you have either pushed a fix OR issued the surgical re-run API call, emit the envelope below and stop. Do NOT wait for the re-run to complete or the new CI/CD status to settle — the babysitter re-evaluates CI/CD on its own schedule and will spawn you again if the failure persists. Long blocking waits inside the session (e.g. `sleep` + polling CircleCI) risk the backend killing the session before you get a chance to emit the envelope.
 
-Respond with `{{"error": false}}` if and only if either you fixed the CI/CD problems, or they were flaky and you re-ran only the flaky tests. Respond with `{{"error": true, "reason": "..."}}` if and only if the CI/CD failure could not be fixed (e.g. OpenAI billing out of money). Respond with `{{"error": true, "reason": "interrupted: <what got done, what's missing>"}}` if your investigation was killed mid-task (backend retries exhausted, internal service error before you could read the failing logs) — do NOT issue a speculative re-run or guess at a fix just to emit a clean envelope.
+Respond with `{{"error": false, "ignore": true, "reason": "..."}}` only in the AWS-auth-denied case described above. Respond with `{{"error": false}}` if and only if either you fixed the CI/CD problems, or they were flaky and you re-ran only the flaky tests. Respond with `{{"error": true, "reason": "..."}}` if and only if the CI/CD failure could not be fixed (e.g. OpenAI billing out of money). Respond with `{{"error": true, "reason": "interrupted: <what got done, what's missing>"}}` if your investigation was killed mid-task (backend retries exhausted, internal service error before you could read the failing logs) — do NOT issue a speculative re-run or guess at a fix just to emit a clean envelope, and do NOT pick `ignore: true` just to escape an investigation you didn't complete.
 """
 
 
@@ -261,14 +262,23 @@ class PRBabysitter:
         claude: ClaudeCloudClient,
         poll_interval: float,
         on_change: Callable[[], None],
+        on_merged: Callable[[], None] = lambda: None,
     ):
         self.pr = pr
         self._github = github
         self._claude = claude
         self._poll_interval = poll_interval
         self._on_change = on_change
+        # Fired exactly once when GitHub reports this PR merged, so the TUI can
+        # drop it from the watch list. Defaults to a no-op for callers that
+        # don't care about auto-removal.
+        self._on_merged = on_merged
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Set True the tick GitHub first reports `merged: true`; guards the
+        # auto-remove callback so it fires at most once even if a tick races
+        # the TUI's stop().
+        self._merged_handled = False
         # caches per tick
         self._check_runs: list[dict] = []  # for HEAD SHA; bugbot/veria/cicd verdicts
         self._issue_comments: list[Comment] = []  # for greptile mention adoption
@@ -317,6 +327,13 @@ class PRBabysitter:
     async def tick(self) -> None:
         self.pr.last_polled_at = time.time()
         await self._refresh_pr_meta()
+        # Once the PR is merged there's nothing left to babysit. Stop the poll
+        # loop and ask the TUI to drop the row. Returning here — before any
+        # subsystem processing — guarantees we never spawn a session or post a
+        # comment against a PR that has already landed.
+        if self.pr.merged:
+            self._finish_merged()
+            return
         # check-runs feed bugbot/veria/cicd verdicts; issue comments feed
         # greptile's "adopt an existing @greptile mention" path.
         try:
@@ -360,6 +377,11 @@ class PRBabysitter:
 
     async def _refresh_pr_meta(self) -> None:
         pr = await self._github.get_pr(self.pr.repo, self.pr.number)
+        # `merged` is only present (and only true) on the single-PR endpoint
+        # `get_pr` hits; it's the canonical "this PR has landed" signal. Once
+        # set it never flips back, so latch it for tick() to act on.
+        if pr.get("merged"):
+            self.pr.merged = True
         self.pr.title = pr.get("title", self.pr.title)
         self.pr.html_url = pr.get("html_url", self.pr.html_url)
         self.pr.head_branch = (pr.get("head") or {}).get("ref", self.pr.head_branch)
@@ -392,6 +414,18 @@ class PRBabysitter:
                 self._latest_commit_at = 0.0
         else:
             self._latest_commit_at = 0.0
+
+    def _finish_merged(self) -> None:
+        """The PR has merged: stop our own poll loop and fire the auto-remove
+        callback exactly once. The callback (wired by the TUI) drops the row
+        and stops/awaits this task; setting `_stop` ourselves means the loop
+        exits cleanly even before that cancellation lands."""
+        if self._merged_handled:
+            return
+        self._merged_handled = True
+        log.info("%s: PR merged; auto-removing from babysit list", self.pr.key)
+        self._stop.set()
+        self._on_merged()
 
     # ----- fork sync -----------------------------------------------------
 
@@ -1046,6 +1080,17 @@ class PRBabysitter:
         sha = self.pr.last_commit_sha
         if not sha:
             return
+        # If a prior agent verified this SHA's failures are not actionable
+        # (e.g. AWS unauthorized-IAM-action — see CICD_PROMPT + _on_cicd_done),
+        # park at DONE without re-evaluating. The underlying CircleCI verdict
+        # is still `failure` and will stay that way until HEAD moves, so
+        # without this short-circuit we'd just respawn the agent every
+        # CICD_FAILURE_TICKS_BEFORE_RESPAWN window to re-confirm the same
+        # unfixable thing.
+        if sub.cicd_ignored_commit and sub.cicd_ignored_commit == sha:
+            if sub.state != SubState.DONE:
+                sub.state = SubState.DONE
+            return
         prev_state = sub.state.value
         verdict = await self._compute_cicd_verdict(sha)
         if verdict == "success":
@@ -1258,6 +1303,17 @@ class PRBabysitter:
             sub.state = SubState.ERROR
             sub.error_reason = envelope.get("reason", "unrecoverable cicd failure")
             sub.detail = sub.error_reason
+        elif envelope.get("ignore") is True:
+            # Agent verified every remaining failure is the AWS unauthorized-IAM
+            # error (see CICD_PROMPT) — not fixable from inside the PR. Park at
+            # DONE for this SHA and remember the SHA so `_process_cicd` short-
+            # circuits subsequent ticks instead of seeing the still-red verdict
+            # and respawning. Cleared when HEAD moves (Subsystem.reset()).
+            sub.cicd_ignored_commit = self.pr.last_commit_sha
+            sub.state = SubState.DONE
+            sub.detail = envelope.get("reason") or "cicd failure not actionable; ignoring"
+            sub.error_reason = None
+            sub.cicd_consecutive_failure_ticks = 0
         else:
             sub.state = SubState.UNKNOWN
             sub.detail = "claude reran/fixed cicd; re-evaluating"
@@ -1338,15 +1394,17 @@ class PRBabysitter:
         sub.claude_last_spawn_at = time.time()
         try:
             session_id = await self._claude.spawn(prompt, self.pr.repo)
-        except SessionSpawnQuotaError as e:
-            # Anthropic's concurrent-session quota is full (or we're inside
-            # the client-side backoff window after a recent 400). Roll back
-            # the respawn guard AND the spawn timestamp so a future tick
-            # re-attempts once the quota frees, instead of consuming this
-            # SHA's spawn budget on a call that never actually opened a
-            # session. Restoring `claude_last_spawn_at` also keeps the
-            # greptile follow-up detector from filtering out comments that
-            # arrived just before this failed attempt.
+        except TransientSpawnError as e:
+            # A transient spawn failure — the concurrent-session quota is full,
+            # the session-creation endpoint returned a 5xx, or the request
+            # never completed (timeout / connection reset). We also land here
+            # while inside the client-side backoff window after a recent
+            # transient failure. Roll back the respawn guard AND the spawn
+            # timestamp so a future tick re-attempts once the condition clears,
+            # instead of consuming this SHA's spawn budget on a call that never
+            # actually opened a session. Restoring `claude_last_spawn_at` also
+            # keeps the greptile follow-up detector from filtering out comments
+            # that arrived just before this failed attempt.
             sub.last_spawn_commit = prev_last_spawn_commit
             sub.claude_last_spawn_at = prev_claude_last_spawn_at
             # Preserve the `#mention:NN` prefix (if any) on `sub.detail` so
@@ -1354,15 +1412,15 @@ class PRBabysitter:
             # extract the mention id on the next tick — otherwise the
             # subsystem would stall until a new commit reset state.
             mention_id = _extract_mention_comment_id(prev_detail)
-            deferred_msg = f"claude spawn ({label}) deferred — session quota busy"
+            deferred_msg = f"claude spawn ({label}) deferred — {e.reason}"
             sub.detail = (
                 f"#mention:{mention_id} | {deferred_msg}"
                 if mention_id is not None
                 else deferred_msg
             )
             log.info(
-                "%s/%s: claude spawn deferred (quota busy): %s",
-                self.pr.key, label, e.detail or e,
+                "%s/%s: claude spawn deferred (%s): %s",
+                self.pr.key, label, e.reason, e.detail or e,
             )
             return
         except Exception as e:

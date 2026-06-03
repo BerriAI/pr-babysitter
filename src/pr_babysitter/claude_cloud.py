@@ -19,7 +19,7 @@ ANTHROPIC_API = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 
-# Model used by the babysitter agent. Managed Agents resolves "claude-opus-4-7"
+# Model used by the babysitter agent. Managed Agents resolves "claude-opus-4-8"
 # to the standard (non-1M-context) variant by default, which matches the prior
 # Claude Cloud contract. The Managed Agents POST /v1/agents schema (see
 # https://platform.claude.com/docs/en/managed-agents/agent-setup) only accepts
@@ -28,30 +28,43 @@ MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 # any of them returns 400 "Extra inputs are not permitted". The only model-side
 # knob is `speed: "fast"` (fast mode), which is the opposite of what we want.
 # So we just pass the model name and let Anthropic pick the default behavior.
-AGENT_MODEL = "claude-opus-4-7"
+AGENT_MODEL = "claude-opus-4-8"
 
 # Where the PR's repository is cloned inside the session container. The system
 # prompt references this path so the user-message prompts don't have to.
 REPO_MOUNT_PATH = "/workspace/repo"
 
 
-# Backoff applied to ALL `POST /v1/sessions` calls after a 400 from that
-# endpoint — the only 400s observed in the wild are Anthropic refusing a new
-# session while a per-account concurrent-session quota is full. Set at the
-# client level so the throttle covers every (PR, subsystem) trying to spawn
-# at once. Cleared as soon as a spawn succeeds.
+# Backoff applied to ALL `POST /v1/sessions` calls after a transient spawn
+# failure (a 400 quota rejection, a 5xx upstream error, or a transport error
+# with no response at all). Set at the client level so a single backoff
+# covers every (PR, subsystem) trying to spawn at once — during an upstream
+# incident we don't want each subsystem independently hammering the endpoint.
+# Cleared as soon as a spawn succeeds.
 SPAWN_BACKOFF_SECONDS = 120.0
 
 
-class SessionSpawnQuotaError(RuntimeError):
-    """`POST /v1/sessions` returned 400. Treated as a transient quota/rate-
-    limit signal: the caller should leave its respawn guard cleared and try
-    again on a future tick, rather than burning a spawn budget or routing to
-    a terminal ERROR state. The 400 response body is exposed as `.detail`."""
+class TransientSpawnError(RuntimeError):
+    """`POST /v1/sessions` failed in a way that is transient and worth
+    retrying on a later tick rather than routing to a terminal ERROR state.
+    Three cases produce this:
 
-    def __init__(self, detail: str):
-        super().__init__(detail or "session spawn rejected with 400")
+    - a 400 from the endpoint — Anthropic refusing a new session while the
+      per-account concurrent-session quota is full;
+    - a 5xx from the endpoint — a transient upstream incident on session
+      creation (500/502/503/504 have all been seen during brief blips);
+    - a transport error — timeout / connection reset / DNS failure, where no
+      HTTP response came back at all.
+
+    The caller should leave its respawn guard cleared and try again later,
+    instead of burning a spawn budget or parking the subsystem in ERROR.
+    `detail` is the raw server body / error string (for logs); `reason` is a
+    short human-facing summary for the TUI detail line."""
+
+    def __init__(self, detail: str, reason: str = "spawn temporarily unavailable"):
+        super().__init__(detail or reason)
         self.detail = detail
+        self.reason = reason
 
 
 # --- JSON envelope parsing -------------------------------------------------
@@ -144,7 +157,7 @@ def extract_envelope(text: str) -> Optional[dict]:
 # (model, thinking budget, tools, MCP servers) changes meaningfully. The
 # bootstrap path recreates the cached agent whenever the persisted version
 # differs, picking up the new payload server-side.
-SYSTEM_PROMPT_VERSION = "v9"
+SYSTEM_PROMPT_VERSION = "v10"
 
 
 def _agent_system_prompt(github_pat: str, circleci_pat: str) -> str:
@@ -317,40 +330,59 @@ class ClaudeCloudClient:
         now = time.time()
         if now < self._spawn_blocked_until:
             remaining = self._spawn_blocked_until - now
-            raise SessionSpawnQuotaError(
-                f"spawn throttled for {remaining:.0f}s after prior 400"
+            raise TransientSpawnError(
+                f"spawn throttled for {remaining:.0f}s after a prior transient failure",
+                reason="spawn backing off",
             )
         await self.ensure_bootstrapped()
         repo_url = f"https://github.com/{repo}"
-        create = await self._client.post(
-            "/v1/sessions",
-            json={
-                "agent": self._agent_id,
-                "environment_id": self._environment_id,
-                "title": f"pr-babysitter: {repo}",
-                "resources": [
-                    {
-                        "type": "github_repository",
-                        "url": repo_url,
-                        "mount_path": REPO_MOUNT_PATH,
-                        "authorization_token": self._gh_pat,
-                    },
-                ],
-            },
-        )
-        if create.status_code == 400:
-            # Surface what the server actually said — `raise_for_status()`
-            # would otherwise discard the body. The only 400 we've seen here
-            # is the concurrent-session quota; treat any 400 as transient
-            # and back off rather than routing the caller to a terminal
-            # ERROR state.
+        try:
+            create = await self._client.post(
+                "/v1/sessions",
+                json={
+                    "agent": self._agent_id,
+                    "environment_id": self._environment_id,
+                    "title": f"pr-babysitter: {repo}",
+                    "resources": [
+                        {
+                            "type": "github_repository",
+                            "url": repo_url,
+                            "mount_path": REPO_MOUNT_PATH,
+                            "authorization_token": self._gh_pat,
+                        },
+                    ],
+                },
+            )
+        except httpx.RequestError as e:
+            # No HTTP response came back at all — connection reset, DNS
+            # failure, or our client timeout fired. Transient by nature: back
+            # off and retry rather than parking the subsystem in ERROR.
+            self._spawn_blocked_until = time.time() + SPAWN_BACKOFF_SECONDS
+            log.warning(
+                "POST /v1/sessions transport error; backing off %.0fs: %r",
+                SPAWN_BACKOFF_SECONDS, e,
+            )
+            raise TransientSpawnError(str(e), reason="spawn request failed, retrying")
+        # Surface what the server actually said on a non-2xx — `raise_for_status()`
+        # would otherwise discard the body. 400 (concurrent-session quota) and
+        # 5xx (transient upstream incident on session creation) are both
+        # retryable: back off and re-attempt on a future tick instead of
+        # routing the caller to a terminal ERROR state. Anything else non-2xx
+        # (401/403 bad key, 404, 422, …) is a real, non-transient error and is
+        # left to raise below.
+        if create.status_code == 400 or create.status_code >= 500:
             body = (create.text or "")[:500]
             self._spawn_blocked_until = time.time() + SPAWN_BACKOFF_SECONDS
             log.warning(
-                "POST /v1/sessions returned 400; backing off %.0fs. body=%s",
-                SPAWN_BACKOFF_SECONDS, body,
+                "POST /v1/sessions returned %d; backing off %.0fs. body=%s",
+                create.status_code, SPAWN_BACKOFF_SECONDS, body,
             )
-            raise SessionSpawnQuotaError(body)
+            reason = (
+                "session quota busy"
+                if create.status_code == 400
+                else f"anthropic {create.status_code}, retrying"
+            )
+            raise TransientSpawnError(body, reason=reason)
         create.raise_for_status()
         self._spawn_blocked_until = 0.0
         session_id = create.json().get("id", "")

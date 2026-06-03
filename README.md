@@ -33,7 +33,8 @@ First launch prompts you for:
 
 Config is saved at `~/.pr-babysitter/config.json`. The babysit list is
 persisted at `~/.pr-babysitter/state.json` so PRs you were watching survive
-restarts.
+restarts. A PR is dropped from the list automatically once GitHub reports it
+merged (you can also remove one by hand with `d`).
 
 ## Keys
 
@@ -53,7 +54,7 @@ restarts.
 Agents](https://platform.claude.com/docs/en/managed-agents/quickstart) API:
 
 1. On first spawn, it creates one shared **agent** (`POST /v1/agents`)
-   declaring the model (`claude-opus-4-7`), a short system prompt, the full
+   declaring the model (`claude-opus-4-8`), a short system prompt, the full
    pre-built `agent_toolset_20260401`, and the [GitHub MCP
    server](https://platform.claude.com/docs/en/managed-agents/github). It
    also creates one shared **environment** (`POST /v1/environments`) with
