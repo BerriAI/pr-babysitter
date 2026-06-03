@@ -33,7 +33,8 @@ First launch prompts you for:
 
 Config is saved at `~/.pr-babysitter/config.json`. The babysit list is
 persisted at `~/.pr-babysitter/state.json` so PRs you were watching survive
-restarts.
+restarts. A PR is dropped from the list automatically once GitHub reports it
+merged (you can also remove one by hand with `d`).
 
 ## Keys
 

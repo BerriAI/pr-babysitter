@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from .claude_cloud import ClaudeCloudClient, SessionSpawnQuotaError, extract_envelope
+from .claude_cloud import ClaudeCloudClient, TransientSpawnError, extract_envelope
 from .config import CONFIG_DIR, _write_text_secure
 from .github_api import Comment, GitHubClient
 from .state import (
@@ -262,14 +262,23 @@ class PRBabysitter:
         claude: ClaudeCloudClient,
         poll_interval: float,
         on_change: Callable[[], None],
+        on_merged: Callable[[], None] = lambda: None,
     ):
         self.pr = pr
         self._github = github
         self._claude = claude
         self._poll_interval = poll_interval
         self._on_change = on_change
+        # Fired exactly once when GitHub reports this PR merged, so the TUI can
+        # drop it from the watch list. Defaults to a no-op for callers that
+        # don't care about auto-removal.
+        self._on_merged = on_merged
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Set True the tick GitHub first reports `merged: true`; guards the
+        # auto-remove callback so it fires at most once even if a tick races
+        # the TUI's stop().
+        self._merged_handled = False
         # caches per tick
         self._check_runs: list[dict] = []  # for HEAD SHA; bugbot/veria/cicd verdicts
         self._issue_comments: list[Comment] = []  # for greptile mention adoption
@@ -318,6 +327,13 @@ class PRBabysitter:
     async def tick(self) -> None:
         self.pr.last_polled_at = time.time()
         await self._refresh_pr_meta()
+        # Once the PR is merged there's nothing left to babysit. Stop the poll
+        # loop and ask the TUI to drop the row. Returning here — before any
+        # subsystem processing — guarantees we never spawn a session or post a
+        # comment against a PR that has already landed.
+        if self.pr.merged:
+            self._finish_merged()
+            return
         # check-runs feed bugbot/veria/cicd verdicts; issue comments feed
         # greptile's "adopt an existing @greptile mention" path.
         try:
@@ -361,6 +377,11 @@ class PRBabysitter:
 
     async def _refresh_pr_meta(self) -> None:
         pr = await self._github.get_pr(self.pr.repo, self.pr.number)
+        # `merged` is only present (and only true) on the single-PR endpoint
+        # `get_pr` hits; it's the canonical "this PR has landed" signal. Once
+        # set it never flips back, so latch it for tick() to act on.
+        if pr.get("merged"):
+            self.pr.merged = True
         self.pr.title = pr.get("title", self.pr.title)
         self.pr.html_url = pr.get("html_url", self.pr.html_url)
         self.pr.head_branch = (pr.get("head") or {}).get("ref", self.pr.head_branch)
@@ -393,6 +414,18 @@ class PRBabysitter:
                 self._latest_commit_at = 0.0
         else:
             self._latest_commit_at = 0.0
+
+    def _finish_merged(self) -> None:
+        """The PR has merged: stop our own poll loop and fire the auto-remove
+        callback exactly once. The callback (wired by the TUI) drops the row
+        and stops/awaits this task; setting `_stop` ourselves means the loop
+        exits cleanly even before that cancellation lands."""
+        if self._merged_handled:
+            return
+        self._merged_handled = True
+        log.info("%s: PR merged; auto-removing from babysit list", self.pr.key)
+        self._stop.set()
+        self._on_merged()
 
     # ----- fork sync -----------------------------------------------------
 
@@ -1361,15 +1394,17 @@ class PRBabysitter:
         sub.claude_last_spawn_at = time.time()
         try:
             session_id = await self._claude.spawn(prompt, self.pr.repo)
-        except SessionSpawnQuotaError as e:
-            # Anthropic's concurrent-session quota is full (or we're inside
-            # the client-side backoff window after a recent 400). Roll back
-            # the respawn guard AND the spawn timestamp so a future tick
-            # re-attempts once the quota frees, instead of consuming this
-            # SHA's spawn budget on a call that never actually opened a
-            # session. Restoring `claude_last_spawn_at` also keeps the
-            # greptile follow-up detector from filtering out comments that
-            # arrived just before this failed attempt.
+        except TransientSpawnError as e:
+            # A transient spawn failure — the concurrent-session quota is full,
+            # the session-creation endpoint returned a 5xx, or the request
+            # never completed (timeout / connection reset). We also land here
+            # while inside the client-side backoff window after a recent
+            # transient failure. Roll back the respawn guard AND the spawn
+            # timestamp so a future tick re-attempts once the condition clears,
+            # instead of consuming this SHA's spawn budget on a call that never
+            # actually opened a session. Restoring `claude_last_spawn_at` also
+            # keeps the greptile follow-up detector from filtering out comments
+            # that arrived just before this failed attempt.
             sub.last_spawn_commit = prev_last_spawn_commit
             sub.claude_last_spawn_at = prev_claude_last_spawn_at
             # Preserve the `#mention:NN` prefix (if any) on `sub.detail` so
@@ -1377,15 +1412,15 @@ class PRBabysitter:
             # extract the mention id on the next tick — otherwise the
             # subsystem would stall until a new commit reset state.
             mention_id = _extract_mention_comment_id(prev_detail)
-            deferred_msg = f"claude spawn ({label}) deferred — session quota busy"
+            deferred_msg = f"claude spawn ({label}) deferred — {e.reason}"
             sub.detail = (
                 f"#mention:{mention_id} | {deferred_msg}"
                 if mention_id is not None
                 else deferred_msg
             )
             log.info(
-                "%s/%s: claude spawn deferred (quota busy): %s",
-                self.pr.key, label, e.detail or e,
+                "%s/%s: claude spawn deferred (%s): %s",
+                self.pr.key, label, e.reason, e.detail or e,
             )
             return
         except Exception as e:

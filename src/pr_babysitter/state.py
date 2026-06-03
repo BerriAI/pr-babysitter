@@ -210,6 +210,9 @@ class PRState:
     # transient/runtime
     last_polled_at: float = 0.0
     last_error: str = ""
+    # Latched True once GitHub reports the PR merged. Drives the TUI's
+    # auto-removal; not persisted (a merged PR is dropped before the next save).
+    merged: bool = False
 
     @property
     def key(self) -> str:
