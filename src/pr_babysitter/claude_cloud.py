@@ -157,7 +157,7 @@ def extract_envelope(text: str) -> Optional[dict]:
 # (model, thinking budget, tools, MCP servers) changes meaningfully. The
 # bootstrap path recreates the cached agent whenever the persisted version
 # differs, picking up the new payload server-side.
-SYSTEM_PROMPT_VERSION = "v9"
+SYSTEM_PROMPT_VERSION = "v10"
 
 
 def _agent_system_prompt(github_pat: str, circleci_pat: str) -> str:
