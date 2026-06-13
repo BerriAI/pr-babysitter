@@ -207,6 +207,13 @@ class PRState:
     veria: Subsystem = field(default_factory=Subsystem)
     cicd: Subsystem = field(default_factory=Subsystem)
 
+    # Latched True once we've posted the single "LGTM; thanks!" comment that
+    # precedes the auto-merge (see babysitter._maybe_auto_merge). Guards against
+    # re-posting the comment every tick while the merge itself is being retried
+    # (e.g. branch protection not yet satisfied). Persisted so a restart between
+    # commenting and merging doesn't post a second comment.
+    lgtm_comment_posted: bool = False
+
     # transient/runtime
     last_polled_at: float = 0.0
     last_error: str = ""
@@ -229,6 +236,11 @@ class PRState:
         self.greptile.reset()
         self.veria.reset()
         self.cicd.reset()
+        # The LGTM comment approves a specific HEAD. When HEAD advances, the
+        # prior approval no longer applies — clear the latch so the next round
+        # of green subsystems posts a fresh LGTM tied to the new commit
+        # instead of merging silently behind a stale approval comment.
+        self.lgtm_comment_posted = False
 
     @property
     def is_copy(self) -> bool:
@@ -309,6 +321,7 @@ class PRState:
             "origin_head_repo": self.origin_head_repo,
             "origin_head_ref": self.origin_head_ref,
             "copy_branch": self.copy_branch,
+            "lgtm_comment_posted": self.lgtm_comment_posted,
             "fork_sync": self.fork_sync.to_dict(),
             "merge": self.merge.to_dict(),
             "bugbot": self.bugbot.to_dict(),
@@ -333,6 +346,7 @@ class PRState:
             origin_head_repo=d.get("origin_head_repo", "") or "",
             origin_head_ref=d.get("origin_head_ref", "") or "",
             copy_branch=d.get("copy_branch", "") or "",
+            lgtm_comment_posted=bool(d.get("lgtm_comment_posted", False)),
         )
         if isinstance(d.get("fork_sync"), dict):
             pr.fork_sync = Subsystem.from_dict(d["fork_sync"])
