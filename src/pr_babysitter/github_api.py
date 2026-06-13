@@ -79,6 +79,11 @@ class GitHubClient:
         r.raise_for_status()
         return r.json() if r.text else None
 
+    async def _put(self, path: str, json: Optional[dict] = None) -> Any:
+        r = await self._client.put(path, json=json)
+        r.raise_for_status()
+        return r.json() if r.text else None
+
     async def get_pr(self, repo: str, number: int) -> dict:
         return await self._get(f"/repos/{repo}/pulls/{number}")
 
@@ -118,6 +123,35 @@ class GitHubClient:
             f"/repos/{repo}/pulls",
             json={"title": title, "body": body, "head": head, "base": base},
         )
+
+    async def merge_pr(
+        self,
+        repo: str,
+        number: int,
+        *,
+        merge_method: str = "merge",
+        sha: Optional[str] = None,
+        commit_title: Optional[str] = None,
+        commit_message: Optional[str] = None,
+    ) -> dict:
+        """Merge a PR via PUT /repos/{repo}/pulls/{number}/merge.
+
+        `sha`, when given, is GitHub's optimistic-concurrency guard: the merge
+        is rejected (409 Conflict) if the PR's HEAD has advanced past it, so we
+        never merge a commit we didn't actually vet. `merge_method` is one of
+        "merge" / "squash" / "rebase" and must be enabled on the repo or GitHub
+        returns 405. A PR that can't be merged yet (failing required checks,
+        unmet branch protection, draft) also returns 405 — callers should treat
+        that as retryable rather than fatal.
+        """
+        body: dict[str, Any] = {"merge_method": merge_method}
+        if sha:
+            body["sha"] = sha
+        if commit_title is not None:
+            body["commit_title"] = commit_title
+        if commit_message is not None:
+            body["commit_message"] = commit_message
+        return await self._put(f"/repos/{repo}/pulls/{number}/merge", json=body)
 
     async def get_commit(self, repo: str, sha: str) -> dict:
         return await self._get(f"/repos/{repo}/commits/{sha}")

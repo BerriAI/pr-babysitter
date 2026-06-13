@@ -247,6 +247,18 @@ INTERRUPTED_RETRY_CAP = 3
 CICD_FAILURE_TICKS_BEFORE_RESPAWN = 3
 
 
+# Once every tracked subsystem is green (PRState.overall_status() == "done"),
+# the babysitter posts this comment and merges the PR automatically. The
+# comment is posted exactly once (guarded by PRState.lgtm_comment_posted); the
+# merge is retried on subsequent ticks if it fails (e.g. branch protection not
+# yet satisfied) until GitHub reports the PR merged.
+AUTO_MERGE_COMMENT = "LGTM; thanks!"
+
+# Merge method for the auto-merge. Must be enabled on the repo or GitHub
+# returns 405. BerriAI/litellm squashes its PRs, so default to "squash".
+AUTO_MERGE_METHOD = "squash"
+
+
 def _login_matches(login: str, candidates: tuple[str, ...]) -> bool:
     lo = (login or "").lower()
     return any(c in lo for c in candidates)
@@ -373,6 +385,13 @@ class PRBabysitter:
         await self._process_veria()
         await self._process_cicd()
 
+        # Every subsystem green? Post the LGTM comment and merge the PR. If the
+        # merge lands, the PR is dropped from the watch list immediately — no
+        # need for a final _on_change() on a row that's about to vanish.
+        await self._maybe_auto_merge()
+        if self.pr.merged:
+            return
+
         self._on_change()
 
     async def _refresh_pr_meta(self) -> None:
@@ -426,6 +445,60 @@ class PRBabysitter:
         log.info("%s: PR merged; auto-removing from babysit list", self.pr.key)
         self._stop.set()
         self._on_merged()
+
+    # ----- auto-merge ----------------------------------------------------
+
+    async def _maybe_auto_merge(self) -> None:
+        """When every tracked subsystem is green, post a single LGTM comment
+        and merge the PR.
+
+        Idempotent and retry-safe:
+        - The comment is posted at most once, guarded by `lgtm_comment_posted`
+          (persisted), so retrying the merge never re-comments.
+        - The merge passes the vetted HEAD sha as GitHub's optimistic-
+          concurrency guard, so a commit that lands between "all green" and the
+          merge call aborts the merge (409) rather than landing unreviewed code;
+          the next tick re-evaluates the new HEAD from scratch.
+        - A merge that isn't permitted yet (branch protection, required human
+          approval, draft) returns 405/422; we log it and let later ticks retry
+          until it goes through, without spamming comments.
+        """
+        if self.pr.overall_status() != "done":
+            return
+
+        if not self.pr.lgtm_comment_posted:
+            try:
+                await self._github.post_issue_comment(
+                    self.pr.repo, self.pr.number, AUTO_MERGE_COMMENT
+                )
+            except Exception as e:
+                self.pr.last_error = f"failed to post LGTM comment: {e}"
+                log.warning(
+                    "%s: all subsystems green but failed to post LGTM comment: %s",
+                    self.pr.key, e,
+                )
+                return
+            self.pr.lgtm_comment_posted = True
+            log.info(
+                "%s: all subsystems green; posted LGTM comment, merging",
+                self.pr.key,
+            )
+
+        try:
+            await self._github.merge_pr(
+                self.pr.repo,
+                self.pr.number,
+                merge_method=AUTO_MERGE_METHOD,
+                sha=self.pr.last_commit_sha or None,
+            )
+        except Exception as e:
+            self.pr.last_error = f"auto-merge failed (will retry): {e}"
+            log.warning("%s: auto-merge failed (will retry next tick): %s", self.pr.key, e)
+            return
+
+        log.info("%s: auto-merged PR (%s)", self.pr.key, AUTO_MERGE_METHOD)
+        self.pr.merged = True
+        self._finish_merged()
 
     # ----- fork sync -----------------------------------------------------
 

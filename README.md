@@ -6,6 +6,13 @@ needed; and spawns [Claude Managed
 Agents](https://platform.claude.com/docs/en/managed-agents/quickstart)
 sessions to resolve real concerns.
 
+Once every subsystem is green, the babysitter posts a `LGTM; thanks!` comment
+and merges the PR automatically (squash merge), then drops it from the watch
+list. The merge passes the vetted HEAD sha as a guard, so a commit that lands
+in the meantime aborts the merge and re-starts review on the new HEAD rather
+than landing unreviewed code. The merge method lives in `AUTO_MERGE_METHOD` in
+`babysitter.py`.
+
 ## Install
 
 ```sh
