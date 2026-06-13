@@ -465,6 +465,20 @@ class PRBabysitter:
         """
         if self.pr.overall_status() != "done":
             return
+        # `overall_status() == "done"` only covers bugbot/greptile/veria/cicd
+        # (see PRState._subs()). Auto-merge is irreversible, so gate it on the
+        # pre-step subsystems too: a copy PR whose upstream is still ahead
+        # must not merge until fork_sync has landed the new commits, and a
+        # PR GitHub reports as conflicted (`mergeable_state == "dirty"` →
+        # merge.state != DONE) must not merge until the conflicts are
+        # resolved. Without these checks, deferred Claude spawns
+        # (TransientSpawnError) or respawn-guard parks can leave fork_sync /
+        # merge at UNKNOWN while the four bots come back green on a stale
+        # HEAD, and we'd LGTM+squash an unsynced or conflicted PR.
+        if self.pr.is_copy and self.pr.fork_sync.state != SubState.DONE:
+            return
+        if self.pr.merge.state != SubState.DONE:
+            return
 
         if not self.pr.lgtm_comment_posted:
             try:
@@ -479,6 +493,13 @@ class PRBabysitter:
                 )
                 return
             self.pr.lgtm_comment_posted = True
+            # Persist the latch to disk BEFORE attempting the merge. If the
+            # process crashes or restarts between posting the comment and the
+            # tick-end `_on_change()`, the restored state would still have
+            # `lgtm_comment_posted=False` and we'd post the comment a second
+            # time on the next run — breaking the documented exactly-once
+            # behavior. Persisting immediately closes that window.
+            self._on_change()
             log.info(
                 "%s: all subsystems green; posted LGTM comment, merging",
                 self.pr.key,

@@ -236,6 +236,11 @@ class PRState:
         self.greptile.reset()
         self.veria.reset()
         self.cicd.reset()
+        # The LGTM comment approves a specific HEAD. When HEAD advances, the
+        # prior approval no longer applies — clear the latch so the next round
+        # of green subsystems posts a fresh LGTM tied to the new commit
+        # instead of merging silently behind a stale approval comment.
+        self.lgtm_comment_posted = False
 
     @property
     def is_copy(self) -> bool:
